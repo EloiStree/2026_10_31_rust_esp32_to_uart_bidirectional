@@ -8,7 +8,7 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either3, select3};
 use embassy_net::{
     IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Runner, Stack, StackResources,
     udp::{PacketMetadata, UdpSocket},
@@ -33,6 +33,8 @@ use crate::ssd1306::StructSetSSD1306;
 
 extern crate alloc;
 
+#[path = "iid_delayer.rs"]
+pub mod iid_delayer;
 #[path = "ssd1306.rs"]
 mod ssd1306;
 
@@ -43,22 +45,25 @@ const UART_DATA_BITS: esp_hal::uart::DataBits = esp_hal::uart::DataBits::_8;
 
 const UART_TX_PIN: u8 = 5;
 const UART_RX_PIN: u8 = 6;
+const UART2_TX_PIN: u8 = 3;
+const UART2_RX_PIN: u8 = 4;
 // 400 kHz is the I2C fast-mode limit; many SSD1306 modules also work at 800-1000 kHz.
 const I2C_FREQUENCY_KHZ: u32 = 400;
 const UDP_PORT: u16 = 3615;
+const UDP_TEXT_PORT: u16 = 3614;
 const UART_TO_UDP_PORT: u16 = 2501;
 const UDP_CLIENT_LIMIT: usize = 8;
 const UDP_BUFFER_SIZE: usize = 4096;
 const UDP_PACKET_SLOTS: usize = 8;
 const DISPLAY_FRAME_SIZE: usize = 1024;
-const TRANSFER_BUFFER_SIZE: usize = 1024;
+const TRANSFER_BUFFER_SIZE: usize = UDP_BUFFER_SIZE;
 
 const MDNS_PORT: u16 = 5353;
 const MDNS_GROUP: Ipv4Address = Ipv4Address::new(224, 0, 0, 251);
 const MDNS_NAME: [&[u8]; 2] = [b"uart", b"local"];
 const MDNS_BUFFER_SIZE: usize = 512;
 
-static NETWORK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+static NETWORK_RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
 static MDNS_RX_BUFFER: StaticCell<[u8; MDNS_BUFFER_SIZE]> = StaticCell::new();
 static MDNS_TX_BUFFER: StaticCell<[u8; MDNS_BUFFER_SIZE]> = StaticCell::new();
 static MDNS_RX_META: StaticCell<[PacketMetadata; 4]> = StaticCell::new();
@@ -68,6 +73,13 @@ static MDNS_PACKET: StaticCell<[u8; MDNS_BUFFER_SIZE]> = StaticCell::new();
 static UDP_RX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
 static UDP_TX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
 static UDP_TO_UART: StaticCell<[u8; TRANSFER_BUFFER_SIZE]> = StaticCell::new();
+static UDP_TEXT_TO_UART: StaticCell<[u8; TRANSFER_BUFFER_SIZE]> = StaticCell::new();
+static UART2_TO_UDP: StaticCell<[u8; TRANSFER_BUFFER_SIZE]> = StaticCell::new();
+static BASE62_FRAME: StaticCell<[u8; BASE62_BUFFER_SIZE]> = StaticCell::new();
+static UDP_TEXT_RX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
+static UDP_TEXT_TX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
+static UDP_TEXT_RX_META: StaticCell<[PacketMetadata; UDP_PACKET_SLOTS]> = StaticCell::new();
+static UDP_TEXT_TX_META: StaticCell<[PacketMetadata; UDP_PACKET_SLOTS]> = StaticCell::new();
 static UART_TO_UDP: StaticCell<[u8; TRANSFER_BUFFER_SIZE]> = StaticCell::new();
 static UDP_RX_META: StaticCell<[PacketMetadata; UDP_PACKET_SLOTS]> = StaticCell::new();
 static UDP_TX_META: StaticCell<[PacketMetadata; UDP_PACKET_SLOTS]> = StaticCell::new();
@@ -213,6 +225,71 @@ async fn write_all(uart: &mut Uart<'static, esp_hal::Async>, data: &[u8]) {
     }
 }
 
+const BASE62_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+// Each input byte needs at most ~1.35 base62 characters, plus the "b:" prefix.
+const BASE62_BUFFER_SIZE: usize = 2 + TRANSFER_BUFFER_SIZE * 3 / 2 + 8;
+
+/// Writes `b:` followed by `data` in base62 (big-endian number, each leading
+/// zero byte kept as a leading `0` character). Returns the output length.
+fn base62_frame(data: &[u8], out: &mut [u8; BASE62_BUFFER_SIZE]) -> usize {
+    out[..2].copy_from_slice(b"b:");
+    let zeros = data.iter().take_while(|&&byte| byte == 0).count();
+    let digits_start = 2 + zeros;
+    out[2..digits_start].fill(b'0');
+
+    // Little-endian base62 digits, built in place.
+    let mut digit_count = 0;
+    for &byte in &data[zeros..] {
+        let mut carry = byte as u32;
+        for digit in &mut out[digits_start..digits_start + digit_count] {
+            carry += (*digit as u32) << 8;
+            *digit = (carry % 62) as u8;
+            carry /= 62;
+        }
+        while carry > 0 {
+            out[digits_start + digit_count] = (carry % 62) as u8;
+            digit_count += 1;
+            carry /= 62;
+        }
+    }
+
+    let digits = &mut out[digits_start..digits_start + digit_count];
+    digits.reverse();
+    for digit in digits.iter_mut() {
+        *digit = BASE62_ALPHABET[*digit as usize];
+    }
+    digits_start + digit_count
+}
+
+/// UART1 and UART2 carry the same outgoing data.
+struct UartPair {
+    uart1: Uart<'static, esp_hal::Async>,
+    uart2: Uart<'static, esp_hal::Async>,
+}
+
+impl UartPair {
+    async fn write_all(&mut self, data: &[u8]) {
+        write_all(&mut self.uart1, data).await;
+        write_all(&mut self.uart2, data).await;
+    }
+}
+
+async fn write_base62(uart: &mut UartPair, data: &[u8], buffer: &mut [u8; BASE62_BUFFER_SIZE]) {
+    let length = base62_frame(data, buffer);
+    uart.write_all(&buffer[..length]).await;
+}
+
+async fn write_due_values(uart: &mut UartPair, delayer: &mut iid_delayer::IndexValueDateDelayer) {
+    let now_ms = delayer.current_time_in_milliseconds_in_esp32();
+    while let Some((index, value)) = delayer.take_due(now_ms) {
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&index.to_le_bytes());
+        bytes[4..].copy_from_slice(&value.to_le_bytes());
+        uart.write_all(&bytes).await;
+    }
+}
+
 fn remember_udp_client(clients: &mut [Option<IpAddress>], address: IpAddress) -> bool {
     if clients.contains(&Some(address)) {
         return true;
@@ -225,6 +302,16 @@ fn remember_udp_client(clients: &mut [Option<IpAddress>], address: IpAddress) ->
     true
 }
 
+fn track_udp_client(clients: &mut [Option<IpAddress>], warned: &mut bool, address: IpAddress) {
+    if !remember_udp_client(clients, address) && !*warned {
+        warn!(
+            "UDP client limit ({}) reached; additional client IPs will not receive UART replies",
+            UDP_CLIENT_LIMIT
+        );
+        *warned = true;
+    }
+}
+
 #[embassy_executor::task]
 #[allow(
     clippy::large_stack_frames,
@@ -232,7 +319,7 @@ fn remember_udp_client(clients: &mut [Option<IpAddress>], address: IpAddress) ->
 )]
 async fn bridge_task(
     stack: Stack<'static>,
-    mut uart: Uart<'static, esp_hal::Async>,
+    mut uart: UartPair,
     mut display: Option<StructSetSSD1306>,
 ) -> ! {
     let rx_buffer = UDP_RX_BUFFER.init([0; UDP_BUFFER_SIZE]);
@@ -256,28 +343,52 @@ async fn bridge_task(
         .expect("Failed to bind the UDP socket");
     info!("Listening for UDP datagrams on 0.0.0.0:{}", UDP_PORT);
 
+    let text_rx_buffer = UDP_TEXT_RX_BUFFER.init([0; UDP_BUFFER_SIZE]);
+    let text_tx_buffer = UDP_TEXT_TX_BUFFER.init([0; UDP_BUFFER_SIZE]);
+    let text_rx_meta = UDP_TEXT_RX_META.init([PacketMetadata::EMPTY; UDP_PACKET_SLOTS]);
+    let text_tx_meta = UDP_TEXT_TX_META.init([PacketMetadata::EMPTY; UDP_PACKET_SLOTS]);
+    let mut text_socket = UdpSocket::new(
+        stack,
+        &mut text_rx_meta[..],
+        &mut text_rx_buffer[..],
+        &mut text_tx_meta[..],
+        &mut text_tx_buffer[..],
+    );
+    text_socket
+        .bind(IpListenEndpoint {
+            addr: None,
+            port: UDP_TEXT_PORT,
+        })
+        .expect("Failed to bind the UDP text socket");
+    info!("Listening for UDP text on 0.0.0.0:{}", UDP_TEXT_PORT);
+
     let udp_to_uart = UDP_TO_UART.init([0; TRANSFER_BUFFER_SIZE]);
+    let text_to_uart = UDP_TEXT_TO_UART.init([0; TRANSFER_BUFFER_SIZE]);
+    let base62_buffer = BASE62_FRAME.init([0; BASE62_BUFFER_SIZE]);
     let uart_to_udp = UART_TO_UDP.init([0; TRANSFER_BUFFER_SIZE]);
+    let uart2_to_udp = UART2_TO_UDP.init([0; TRANSFER_BUFFER_SIZE]);
     let mut udp_clients = [None; UDP_CLIENT_LIMIT];
     let mut client_limit_warned = false;
+    let mut delayer = iid_delayer::IndexValueDateDelayer::new();
 
     loop {
-        match select(
+        match select3(
             socket.recv_from(&mut udp_to_uart[..]),
-            uart.read_async(&mut uart_to_udp[..]),
+            text_socket.recv_from(&mut text_to_uart[..]),
+            select3(
+                uart.uart1.read_async(&mut uart_to_udp[..]),
+                uart.uart2.read_async(&mut uart2_to_udp[..]),
+                Timer::after_millis(1),
+            ),
         )
         .await
         {
-            Either::First(Ok((length, sender))) => {
-                if !remember_udp_client(&mut udp_clients, sender.endpoint.addr)
-                    && !client_limit_warned
-                {
-                    warn!(
-                        "UDP client limit ({}) reached; additional client IPs will not receive UART replies",
-                        UDP_CLIENT_LIMIT
-                    );
-                    client_limit_warned = true;
-                }
+            Either3::First(Ok((length, sender))) => {
+                track_udp_client(
+                    &mut udp_clients,
+                    &mut client_limit_warned,
+                    sender.endpoint.addr,
+                );
 
                 if length == DISPLAY_FRAME_SIZE {
                     let frame: &[u8; DISPLAY_FRAME_SIZE] = udp_to_uart[..DISPLAY_FRAME_SIZE]
@@ -289,14 +400,40 @@ async fn bridge_task(
                     {
                         warn!("Display update failed: {:?}", error);
                     }
+                } else if length == 1 || length == 2 || length == 4 {
+                    write_base62(&mut uart, &udp_to_uart[..length], base62_buffer).await;
+                } else if length % 16 == 0 {
+                    match delayer.append_index_value_with_delay_from_array_dividable_by_16_bytes(
+                        &udp_to_uart[..length],
+                    ) {
+                        Ok(queued) if queued < length / 16 => {
+                            warn!(
+                                "Ignored {} UDP record(s) that do not use the delayed iiQ format",
+                                length / 16 - queued
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!("Delayed UDP queue is full: {:?}", error),
+                    }
                 } else {
-                    write_all(&mut uart, &udp_to_uart[..length]).await;
+                    write_base62(&mut uart, &udp_to_uart[..length], base62_buffer).await;
                 }
             }
-            Either::First(Err(error)) => {
+            Either3::First(Err(error)) => {
                 warn!("UDP receive failed: {:?}", error);
             }
-            Either::Second(Ok(length)) => {
+            Either3::Second(Ok((length, sender))) => {
+                track_udp_client(
+                    &mut udp_clients,
+                    &mut client_limit_warned,
+                    sender.endpoint.addr,
+                );
+                uart.write_all(&text_to_uart[..length]).await;
+            }
+            Either3::Second(Err(error)) => {
+                warn!("UDP text receive failed: {:?}", error);
+            }
+            Either3::Third(Either3::First(Ok(length))) => {
                 for address in udp_clients.iter().flatten() {
                     let destination = IpEndpoint::new(*address, UART_TO_UDP_PORT);
                     if let Err(error) = socket.send_to(&uart_to_udp[..length], destination).await {
@@ -304,10 +441,24 @@ async fn bridge_task(
                     }
                 }
             }
-            Either::Second(Err(error)) => {
-                warn!("UART read failed: {:?}", error);
+            Either3::Third(Either3::First(Err(error))) => {
+                warn!("UART1 read failed: {:?}", error);
             }
+            Either3::Third(Either3::Second(Ok(length))) => {
+                for address in udp_clients.iter().flatten() {
+                    let destination = IpEndpoint::new(*address, UART_TO_UDP_PORT);
+                    if let Err(error) = socket.send_to(&uart2_to_udp[..length], destination).await {
+                        warn!("UART2-to-UDP send failed: {:?}", error);
+                    }
+                }
+            }
+            Either3::Third(Either3::Second(Err(error))) => {
+                warn!("UART2 read failed: {:?}", error);
+            }
+            Either3::Third(Either3::Third(())) => {}
         }
+
+        write_due_values(&mut uart, &mut delayer).await;
     }
 }
 
@@ -413,15 +564,25 @@ async fn main(spawner: Spawner) -> ! {
         .with_parity(UART_PARITY)
         .with_stop_bits(UART_STOP_BITS)
         .with_data_bits(UART_DATA_BITS);
-    let uart = Uart::new(peripherals.UART1, uart_config)
+    let uart1 = Uart::new(peripherals.UART1, uart_config)
         .expect("UART1 configuration failed")
         .with_rx(peripherals.GPIO6)
         .with_tx(peripherals.GPIO5)
         .into_async();
+    let uart2 = Uart::new(peripherals.UART2, uart_config)
+        .expect("UART2 configuration failed")
+        .with_rx(peripherals.GPIO4)
+        .with_tx(peripherals.GPIO3)
+        .into_async();
+    let uart = UartPair { uart1, uart2 };
 
     info!(
         "UART1 bidirectional: TX GPIO{}, RX GPIO{} at {} baud",
         UART_TX_PIN, UART_RX_PIN, UART_BAUDRATE
+    );
+    info!(
+        "UART2 bidirectional: TX GPIO{}, RX GPIO{} at {} baud",
+        UART2_TX_PIN, UART2_RX_PIN, UART_BAUDRATE
     );
     let ipv4 = stack.config_v4().unwrap().address;
 

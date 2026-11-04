@@ -23,7 +23,7 @@ BLACK_SCREEN = secrets.token_bytes(1024)
 
 line_index = 0
 while True:
-    sleep(1.0/60.0)
+    sleep(1.0/20.0)
     # with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
     #     #Randomise the payload for each send
     #     payload = secrets.token_bytes(1024)
