@@ -13,3 +13,8 @@ https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/
 
 The idea is to send information over UDP using the device's Wi-Fi mDNS address. The device then broadcasts UDP messages back to all devices communicating with it, using a configured port.
 It is designed to act as a Wi-Fi hub between learning environments such as Godot (or other programming languages) and Micro:bit-based mini robots, such as the KS4036.
+
+init
+```
+cargo run --release
+```
