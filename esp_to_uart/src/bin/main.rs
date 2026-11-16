@@ -497,8 +497,8 @@ async fn main(spawner: Spawner) -> ! {
             .with_frequency(esp_hal::time::Rate::from_khz(I2C_FREQUENCY_KHZ)),
     )
     .unwrap()
-    .with_sda(peripherals.GPIO7)
-    .with_scl(peripherals.GPIO8);
+    .with_sda(peripherals.GPIO8)
+    .with_scl(peripherals.GPIO9);
     let mut display = match StructSetSSD1306::new(i2c) {
         Ok(display) => Some(display),
         Err(error) => {

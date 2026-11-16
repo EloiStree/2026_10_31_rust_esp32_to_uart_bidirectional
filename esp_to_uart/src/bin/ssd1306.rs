@@ -8,8 +8,8 @@ use embedded_graphics::{
     text::{Baseline, Text},
 };
 
-pub const SSD1306_SDA_PIN: u8 = 7;
-pub const SSD1306_SCL_PIN: u8 = 8;
+pub const SSD1306_SDA_PIN: u8 = 8;
+pub const SSD1306_SCL_PIN: u8 = 9;
 pub const SSD1306_I2C_ADDRESSES: [u8; 2] = [0x3C, 0x3D];
 
 /// Helper for drawing simple patterns on a monochrome SSD1306 display.
