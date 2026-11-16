@@ -3,7 +3,7 @@ import time
 
 
 UDP_IP = "192.168.137.50"
-UDP_PORT = 3614
+UDP_PORT = 3615
 UDP_REPLY_PORT = 2501
 
 
@@ -25,7 +25,8 @@ values = [1175, 1174,1800,1801,1802,1803,1804,1805,2800,2801,2802,2803,2804,2805
 
 def send_value(value):
     data = f"{value}\n".encode("utf-8")
-    sock.sendto(data, (UDP_IP, UDP_PORT))
+    sock.sendto(data, (UDP_IP, 3615))
+    sock.sendto(data, (UDP_IP, 3614))
     print(f"Sent {value} to {UDP_IP}:{UDP_PORT} -> {value}")
 
 if __name__ == "__main__":

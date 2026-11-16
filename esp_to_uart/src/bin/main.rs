@@ -270,6 +270,11 @@ struct UartPair {
 
 impl UartPair {
     async fn write_all(&mut self, data: &[u8]) {
+        info!(
+            "Sending {} bytes to UART1 and UART2: {:?}",
+            data.len(),
+            data
+        );
         write_all(&mut self.uart1, data).await;
         write_all(&mut self.uart2, data).await;
     }
@@ -434,6 +439,11 @@ async fn bridge_task(
                 warn!("UDP text receive failed: {:?}", error);
             }
             Either3::Third(Either3::First(Ok(length))) => {
+                info!(
+                    "Received {} bytes from UART1: {:?}",
+                    length,
+                    &uart_to_udp[..length]
+                );
                 for address in udp_clients.iter().flatten() {
                     let destination = IpEndpoint::new(*address, UART_TO_UDP_PORT);
                     if let Err(error) = socket.send_to(&uart_to_udp[..length], destination).await {
@@ -445,6 +455,11 @@ async fn bridge_task(
                 warn!("UART1 read failed: {:?}", error);
             }
             Either3::Third(Either3::Second(Ok(length))) => {
+                info!(
+                    "Received {} bytes from UART2: {:?}",
+                    length,
+                    &uart2_to_udp[..length]
+                );
                 for address in udp_clients.iter().flatten() {
                     let destination = IpEndpoint::new(*address, UART_TO_UDP_PORT);
                     if let Err(error) = socket.send_to(&uart2_to_udp[..length], destination).await {
